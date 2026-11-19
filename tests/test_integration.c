@@ -73,7 +73,9 @@ static void tc_int_002(void)
     rm_regs[RM_RX_FIFO] = 0xCBU;
     TH_CHECK(ADT7410_OK == adt7410_init(&dev, &iic, 0x48U, &cfg_default));
 
-    rm_regs[RM_ISR] = RM_ISR_TX_ERR;         /* Sensor stops ACKing */
+    /* Sensor stops ACKing: slave NACK -> TX_ERR with no data received */
+    rm_regs[RM_ISR] = RM_ISR_TX_ERR;
+    rm_regs[RM_SR] = RM_SR_TX_EMPTY | RM_SR_RX_EMPTY;
     status = adt7410_get_hysteresis(&dev, &hyst_degc);
     TH_CHECK(ADT7410_ERR_I2C_COMM == status);
 

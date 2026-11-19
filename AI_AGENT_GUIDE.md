@@ -58,7 +58,7 @@ sau** (không suy đoán từ tên file hoặc trí nhớ):
 
 ### Bước 3 — Giao diện Public, Mã nguồn Production & Ứng dụng mẫu
 7. [include/axi_iic_hal.h](include/axi_iic_hal.h) & [src/axi_iic_hal.c](src/axi_iic_hal.c)
-   (3 public APIs + 12 `static` helpers).
+   (3 public APIs + 17 `static` helpers).
 8. [include/adt7410_driver.h](include/adt7410_driver.h) & [src/adt7410_driver.c](src/adt7410_driver.c)
    (13 public APIs + 2 LUTs + 19 `static` helpers).
 9. [src/main.c](src/main.c) & [docs/DRIVER_USAGE_GUIDE.md](docs/DRIVER_USAGE_GUIDE.md)
@@ -67,7 +67,7 @@ sau** (không suy đoán từ tên file hoặc trí nhớ):
 ### Bước 4 — Kiểm thử, Build System & Báo cáo hiện trạng
 10. [tests/test_harness.h](tests/test_harness.h), [tests/regmodel.h](tests/regmodel.h),
     [tests/mock_axi_iic.h](tests/mock_axi_iic.h), [tests/mock_axi_iic.c](tests/mock_axi_iic.c).
-11. [tests/test_axi_iic_hal.c](tests/test_axi_iic_hal.c) (`13` TCs: `TC-IIC-001..022`),
+11. [tests/test_axi_iic_hal.c](tests/test_axi_iic_hal.c) (`14` TCs: `TC-IIC-001..023`),
     [tests/test_adt7410_driver.c](tests/test_adt7410_driver.c) (`31` TCs: `TC-ADT-001..051`),
     [tests/test_integration.c](tests/test_integration.c) (`2` TCs: `TC-INT-001..002`),
     [tests/test_app.c](tests/test_app.c) (`10` TCs: `TC-APP-001..010`).
@@ -130,6 +130,8 @@ dưới đây và ghi nhận bằng chứng theo từng mục (`file:line` cụ 
 - Kiểm tra mọi vòng `while` chờ phần cứng trong `src/axi_iic_hal.c` (`wait_bus_not_busy`, `push_tx_fifo_word`, `pop_rx_fifo_byte`, `wait_tx_complete`):
   - Phải đọc thanh ghi trước khi vào vòng lặp.
   - Phải giảm `remaining_polls--` và thoát khi `0U == remaining_polls` hoặc khi `check_isr_errors()` phát hiện `ISR.TX_ERR` (NACK) / `ISR.ARB_LOST` (`AXI_IIC_ERR_NACK_ARB`).
+  - Riêng đường đọc (`write_read`): `TX_ERR` chỉ là lỗi khi RX FIFO trống **và** bus đã nhả (SR.BB = 0); nếu có dữ liệu hoặc bus còn bận thì chờ tiếp (`check_rx_wait_errors()`), hết thời gian mà vẫn có `TX_ERR` → NACK (`rx_timeout_status()`); sau khi đã nhận đủ byte, `TX_ERR` là NACK cuối của chính master và được xóa (`wait_rx_complete()`, `OI-03`). Trên board, `TX_ERR` hiện ra cùng lúc với byte cuối (raw probe), nên không được giả định thứ tự. `ARB_LOST` luôn là lỗi.
+  - Bit SR: `TX_FULL` là bit 4 (`0x10`), bit 5 (`0x20`) là `RX_FULL` (PG090).
   - Xác nhận tổng vòng lặp không vượt quá giới hạn WCET (`(n + 3) * P` cho write, `(n + 6) * P` cho write-read).
 - Kiểm tra `src/main.c`:
   - `adt7410_int_pin_isr()` tuyệt đối không gọi hàm I2C nào, chỉ gán `g_is_int_alert_pending = true;`.
@@ -144,7 +146,7 @@ dưới đây và ghi nhận bằng chứng theo từng mục (`file:line` cụ 
 
 ### Trục 6: Đối Chiếu Open Items & Trung Thực Báo Cáo (`OI-01`..`OI-08`)
 - Đối chiếu `docs/OPEN_ITEMS.md`:
-  - `OI-01` (HLR chính thức), `OI-02` (`ADT7410_ERR_NOT_READY` chưa dùng), `OI-03` (`ISR.TX_ERR` cuối master receive trên IP thật), `OI-04` (ARM stack/WCET), `OI-05` (`ASSERT` trap rỗng trong `DEBUG_BUILD`), `OI-06` (rev datasheet), `OI-07` (derived requirements), `OI-08` (đo `t_poll` trên target và chốt `APP_IIC_TIMEOUT_POLLS` so với chu kỳ 10 ms).
+  - `OI-01` (HLR chính thức), `OI-02` (`ADT7410_ERR_NOT_READY` chưa dùng), `OI-03` (đã sửa trong code: `ISR.TX_ERR` do master NACK byte cuối, đã xác nhận trên phần cứng, chờ test lại trên board), `OI-04` (ARM stack/WCET), `OI-05` (`ASSERT` trap rỗng trong `DEBUG_BUILD`), `OI-06` (rev datasheet), `OI-07` (derived requirements), `OI-08` (đo `t_poll` trên target và chốt `APP_IIC_TIMEOUT_POLLS` so với chu kỳ 10 ms).
 - **Nguyên tắc trung thực tuyệt đối của AI Agent**:
   - Chỉ báo cáo `PASS` cho các kiểm tra **thực sự đã chạy thành công sau lần sửa cuối cùng** (ví dụ `tests/run_tests.ps1 -FormatOnly` nếu máy chưa cài `gcc`).
   - Nếu máy chưa có `gcc` / `gcov` / phần cứng HIL, phải giữ nguyên trạng thái `PENDING` như trong `docs/test_report.md` §7, tuyệt đối không suy diễn hoặc bịa kết quả test.

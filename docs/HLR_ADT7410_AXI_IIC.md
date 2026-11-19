@@ -28,6 +28,7 @@
 Per `docs/LLR_ADT7410_AXI_IIC.md` (§1.1) and `OI-07`, the following derived LLR clauses
 must be submitted to the system safety assessment process:
 - `LLR-IIC-001.3` (32-bit Hamming-distance-31 lifecycle state encoding)
+- `LLR-IIC-004.6` (TX_ERR from the master's final NACK is not an error)
 - `LLR-ADT-001.2` (Mapping all non-OK HAL errors to `ADT7410_ERR_I2C_COMM`)
 - `LLR-ADT-001.10` (32-bit Hamming-distance-31 driver lifecycle state encoding)
 - `LLR-ADT-003.6` (Defensive `ERR_STATE` handling for corrupted `active_res`)

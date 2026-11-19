@@ -43,9 +43,13 @@
 #define AXI_IIC_CR_EN_MASK          (0x00000001U) /* Enable AXI IIC          */
 #define AXI_IIC_CR_TX_RST_MASK      (0x00000002U) /* TX FIFO Reset           */
 
-/* Status Register Masks (PG090 SR Offset 0x104) */
+/* Status Register Masks (PG090 SR Offset 0x104).
+ * Layout: [7] TX_EMPTY [6] RX_EMPTY [5] RX_FULL [4] TX_FULL [3] SRW
+ *         [2] BB [1] AAS [0] ABGC. TX_FULL is bit 4 (not bit 5, which is
+ *         RX_FULL): waiting on bit 5 would let a > 16-word transfer
+ *         overflow the TX FIFO. */
 #define AXI_IIC_SR_BB_MASK          (0x00000004U) /* Bus Busy                */
-#define AXI_IIC_SR_TX_FULL_MASK     (0x00000020U) /* TX FIFO Full            */
+#define AXI_IIC_SR_TX_FULL_MASK     (0x00000010U) /* TX FIFO Full            */
 #define AXI_IIC_SR_RX_EMPTY_MASK    (0x00000040U) /* RX FIFO Empty           */
 #define AXI_IIC_SR_TX_EMPTY_MASK    (0x00000080U) /* TX FIFO Empty           */
 
@@ -109,6 +113,11 @@ static axi_iic_status_t push_tx_fifo_word(axi_iic_dev_t const * p_dev,
 static axi_iic_status_t pop_rx_fifo_byte(axi_iic_dev_t const * p_dev,
                                          uint8_t * p_out_byte);
 static axi_iic_status_t wait_tx_complete(axi_iic_dev_t const * p_dev);
+static axi_iic_status_t check_rx_wait_errors(uintptr_t base_addr);
+static axi_iic_status_t rx_timeout_status(uintptr_t base_addr);
+static axi_iic_status_t check_arb_lost(uintptr_t base_addr);
+static void clear_master_nack_flag(uintptr_t base_addr);
+static axi_iic_status_t wait_rx_complete(axi_iic_dev_t const * p_dev);
 
 
 /* Public API implementations (Doxygen contract in axi_iic_hal.h) */
@@ -322,7 +331,9 @@ axi_iic_status_t axi_iic_write_read_bytes(axi_iic_dev_t const * p_dev,
 
         if (AXI_IIC_OK == result)
         {
-            result = wait_tx_complete(p_dev);
+            /* All bytes received: TX_ERR now is the master's own final
+             * NACK, not a slave error (OI-03) */
+            result = wait_rx_complete(p_dev);
         }
         else
         {
@@ -706,7 +717,7 @@ static axi_iic_status_t pop_rx_fifo_byte(axi_iic_dev_t const * p_dev,
            && (AXI_IIC_OK == result))
     {
         remaining_polls--;
-        result = check_isr_errors(p_dev->base_addr);
+        result = check_rx_wait_errors(p_dev->base_addr);
         sr_flags = reg_read32(p_dev->base_addr, AXI_IIC_REG_SR_OFFSET);
     }
 
@@ -716,7 +727,8 @@ static axi_iic_status_t pop_rx_fifo_byte(axi_iic_dev_t const * p_dev,
     }
     else if (0U != (sr_flags & AXI_IIC_SR_RX_EMPTY_MASK))
     {
-        result = AXI_IIC_ERR_TIMEOUT;
+        /* No data within P polls: NACK if TX_ERR latched, else timeout */
+        result = rx_timeout_status(p_dev->base_addr);
     }
     else
     {
@@ -772,6 +784,216 @@ static axi_iic_status_t wait_tx_complete(axi_iic_dev_t const * p_dev)
     {
         /* A NACK can latch in the same cycle the bus goes idle */
         result = check_isr_errors(p_dev->base_addr);
+    }
+
+    return result;
+}
+
+
+/**
+ * @brief       Check ISR while waiting for RX data of a master receive.
+ * @req         LLR-IIC-004
+ * @design      SDD-IIC-3.13
+ * @param[in]   base_addr  Base address of the AXI IIC peripheral.
+ * @return      AXI_IIC_OK or AXI_IIC_ERR_NACK_ARB.
+ * @note        ARB_LOST is always an error. A latched TX_ERR is judged from
+ *              SR, independent of the order in which the core shows the
+ *              flag and the data (board: both within one register read):
+ *              data in the RX FIFO, or transfer still running (BB = 1) ->
+ *              possibly the master's own final NACK (OI-03), keep waiting;
+ *              bus released (BB = 0) with no data -> slave NACK -> error.
+ *              Recovery as in check_isr_errors().
+ */
+static axi_iic_status_t check_rx_wait_errors(uintptr_t base_addr)
+{
+    axi_iic_status_t result = AXI_IIC_OK;
+    uint32_t isr_flags = 0U;
+    uint32_t sr_flags = 0U;
+
+    ASSERT(0U != base_addr);
+
+    isr_flags = reg_read32(base_addr, AXI_IIC_REG_ISR_OFFSET);
+
+    if (0U != (isr_flags & AXI_IIC_ISR_ARB_LOST_MASK))
+    {
+        clear_tx_fifo_and_errors(base_addr);
+        result = AXI_IIC_ERR_NACK_ARB;
+    }
+    else if (0U == (isr_flags & AXI_IIC_ISR_TX_ERR_MASK))
+    {
+        /* No error latched */
+        result = AXI_IIC_OK;
+    }
+    else
+    {
+        /* TX_ERR latched: SR tells who sent the NACK */
+        sr_flags = reg_read32(base_addr, AXI_IIC_REG_SR_OFFSET);
+        if (0U == (sr_flags & AXI_IIC_SR_RX_EMPTY_MASK))
+        {
+            /* Data waiting: expected master NACK of the last byte */
+            result = AXI_IIC_OK;
+        }
+        else if (0U != (sr_flags & AXI_IIC_SR_BB_MASK))
+        {
+            /* Transfer still running: the byte may not be visible yet */
+            result = AXI_IIC_OK;
+        }
+        else
+        {
+            /* Bus released and no data: the slave did not acknowledge */
+            clear_tx_fifo_and_errors(base_addr);
+            result = AXI_IIC_ERR_NACK_ARB;
+        }
+    }
+
+    return result;
+}
+
+
+/**
+ * @brief       Check ISR for Arbitration Lost only.
+ * @req         LLR-IIC-004
+ * @design      SDD-IIC-3.14
+ * @param[in]   base_addr  Base address of the AXI IIC peripheral.
+ * @return      AXI_IIC_OK or AXI_IIC_ERR_NACK_ARB.
+ * @note        Used after every byte of a master receive has arrived, when
+ *              TX_ERR is no longer a slave error. Recovery on error.
+ */
+static axi_iic_status_t check_arb_lost(uintptr_t base_addr)
+{
+    axi_iic_status_t result = AXI_IIC_OK;
+    uint32_t isr_flags = 0U;
+
+    ASSERT(0U != base_addr);
+
+    isr_flags = reg_read32(base_addr, AXI_IIC_REG_ISR_OFFSET);
+    if (0U != (isr_flags & AXI_IIC_ISR_ARB_LOST_MASK))
+    {
+        clear_tx_fifo_and_errors(base_addr);
+        result = AXI_IIC_ERR_NACK_ARB;
+    }
+    else
+    {
+        result = AXI_IIC_OK;
+    }
+
+    return result;
+}
+
+
+/**
+ * @brief       Clear a TX_ERR latched by the master's own final NACK.
+ * @req         LLR-IIC-004
+ * @design      SDD-IIC-3.15
+ * @param[in]   base_addr  Base address of the AXI IIC peripheral.
+ * @note        Toggle-on-write clear (PG090 ISR), so the expected flag does
+ *              not stay latched after a successful receive.
+ */
+static void clear_master_nack_flag(uintptr_t base_addr)
+{
+    uint32_t isr_flags = 0U;
+
+    ASSERT(0U != base_addr);
+
+    isr_flags = reg_read32(base_addr, AXI_IIC_REG_ISR_OFFSET);
+    if (0U != (isr_flags & AXI_IIC_ISR_TX_ERR_MASK))
+    {
+        reg_write32(base_addr,
+                    AXI_IIC_REG_ISR_OFFSET,
+                    AXI_IIC_ISR_TX_ERR_MASK);
+    }
+    else
+    {
+        /* No master NACK flag latched; nothing to clear */
+    }
+}
+
+
+/**
+ * @brief       Wait for bus idle at the end of a master receive.
+ * @req         LLR-IIC-004
+ * @design      SDD-IIC-3.16
+ * @param[in]   p_dev  Pointer to initialized AXI IIC device.
+ * @return      AXI_IIC_OK, AXI_IIC_ERR_NACK_ARB, or AXI_IIC_ERR_TIMEOUT.
+ * @note        Same loop as wait_tx_complete(), but every byte has already
+ *              been received, so only ARB_LOST is an error; a latched
+ *              TX_ERR is the master's final NACK and is cleared on success.
+ *              Bounded by p_dev->timeout_polls <= AXI_IIC_MAX_POLL_LIMIT.
+ */
+static axi_iic_status_t wait_rx_complete(axi_iic_dev_t const * p_dev)
+{
+    axi_iic_status_t result = AXI_IIC_OK;
+    uint32_t sr_flags = 0U;
+    uint32_t remaining_polls = 0U;
+    bool is_done = false;
+
+    ASSERT(NULL != p_dev);
+
+    sr_flags = reg_read32(p_dev->base_addr, AXI_IIC_REG_SR_OFFSET);
+    is_done = is_tx_idle(sr_flags);
+    remaining_polls = p_dev->timeout_polls;
+
+    while ((!is_done)
+           && (0U < remaining_polls)
+           && (AXI_IIC_OK == result))
+    {
+        remaining_polls--;
+        result = check_arb_lost(p_dev->base_addr);
+        sr_flags = reg_read32(p_dev->base_addr, AXI_IIC_REG_SR_OFFSET);
+        is_done = is_tx_idle(sr_flags);
+    }
+
+    if (AXI_IIC_OK != result)
+    {
+        /* Arbitration lost already captured in result */
+    }
+    else if (!is_done)
+    {
+        result = AXI_IIC_ERR_TIMEOUT;
+    }
+    else
+    {
+        result = check_arb_lost(p_dev->base_addr);
+    }
+
+    if (AXI_IIC_OK == result)
+    {
+        clear_master_nack_flag(p_dev->base_addr);
+    }
+    else
+    {
+        /* Error path: recovery already cleared the error flags */
+    }
+
+    return result;
+}
+
+
+/**
+ * @brief       Classify an RX wait that ended without data.
+ * @req         LLR-IIC-004
+ * @design      SDD-IIC-3.17
+ * @param[in]   base_addr  Base address of the AXI IIC peripheral.
+ * @return      AXI_IIC_ERR_NACK_ARB if TX_ERR is latched (slave NACK while
+ *              the bus was still held), else AXI_IIC_ERR_TIMEOUT.
+ * @note        Recovery (TX FIFO reset, error flags cleared) on NACK.
+ */
+static axi_iic_status_t rx_timeout_status(uintptr_t base_addr)
+{
+    axi_iic_status_t result = AXI_IIC_ERR_TIMEOUT;
+    uint32_t isr_flags = 0U;
+
+    ASSERT(0U != base_addr);
+
+    isr_flags = reg_read32(base_addr, AXI_IIC_REG_ISR_OFFSET);
+    if (0U != (isr_flags & AXI_IIC_ISR_TX_ERR_MASK))
+    {
+        clear_tx_fifo_and_errors(base_addr);
+        result = AXI_IIC_ERR_NACK_ARB;
+    }
+    else
+    {
+        result = AXI_IIC_ERR_TIMEOUT;
     }
 
     return result;

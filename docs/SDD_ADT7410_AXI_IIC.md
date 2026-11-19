@@ -3,7 +3,7 @@
 | Field | Value |
 |:---|:---|
 | Document ID | SDD-ADT-IIC |
-| Revision | Draft B |
+| Revision | Draft C |
 | Software items | `include/axi_iic_hal.h`, `src/axi_iic_hal.c`, `include/adt7410_driver.h`, `src/adt7410_driver.c`, `src/main.c` |
 | Requirements | LLR-ADT-IIC (`LLR_ADT7410_AXI_IIC.md`) |
 | Coding standard | C Coding Rules v3 (MISRA C:2012 + BARR-C:2018 + DO-178C) |
@@ -15,6 +15,7 @@
 |:---|:---|
 | Draft A | Initial SDD for HAL and driver |
 | Draft B | Added SDD-ADT-2.13 / 3.21 (float degC API); added §5 SDD-APP for `src/main.c` (incl. timing analysis SDD-APP-4); updated stack figures; restored Markdown formatting |
+| Draft C | Master-receive completion: SDD-IIC-3.13 … 3.17 (TX_ERR from the master's final NACK is not an error, OI-03; decision independent of flag/data order); SR.TX_FULL corrected to bit 4 |
 
 ---
 
@@ -158,7 +159,7 @@ Any other value (zeroed RAM, bit-flip) counts as "not ready".
 | 0x020 | ISR | Bit 0 ARB_LOST, bit 1 TX_ERR; toggle-on-write clear |
 | 0x040 | SOFTR | Write `0xA` = soft reset |
 | 0x100 | CR | Bit 0 EN, bit 1 TX_FIFO_RESET |
-| 0x104 | SR | Bit 2 BB, bit 5 TX_FULL, bit 6 RX_EMPTY, bit 7 TX_EMPTY |
+| 0x104 | SR | Bit 2 BB, bit 3 SRW (master reading), bit 4 TX_FULL, bit 5 RX_FULL, bit 6 RX_EMPTY, bit 7 TX_EMPTY |
 | 0x108 | TX_FIFO | `[9]` STOP, `[8]` START, `[7:0]` data / address / count |
 | 0x10C | RX_FIFO | `[7:0]` received byte |
 | 0x120 | RX_FIFO_PIRQ | `0x0F` (16-deep) |
@@ -216,7 +217,9 @@ push  reg_addr                  (no STOP -> repeated START follows)
 push  START | addr<<1 | R
 push  STOP  | n                 (controller receives n bytes, NACKs last, STOPs)
 for i in 0..n-1: pop_rx_fifo_byte(&p_rx_bytes[i])
-wait_tx_complete()
+                                (TX_ERR is an error only while RX is empty)
+wait_rx_complete()              (only ARB_LOST is an error; clears the
+                                 TX_ERR latched by the master's final NACK)
 ```
 
 Bus sequence: `S | ADDR+W | A | REG | A | Sr | ADDR+R | A | D0 | A | … | Dn-1 | N | P`.
@@ -232,12 +235,37 @@ WCET: ≤ `(n + 6) × P` poll iterations.
 | SDD-IIC-3.4 | `wait_bus_not_busy()` | Pre-START idle wait | Reads SR before the first test, ≤ `P` polls |
 | SDD-IIC-3.5 | `check_isr_errors()` | Error detector | ISR & (ARB_LOST or TX_ERR) ≠ 0 → recovery + `ERR_NACK_ARB` |
 | SDD-IIC-3.6 | `push_tx_fifo_word()` | Flow-controlled TX | Waits on TX_FULL with ISR check each poll, ≤ `P` |
-| SDD-IIC-3.7 | `pop_rx_fifo_byte()` | Flow-controlled RX | Waits on RX_EMPTY with ISR check each poll, ≤ `P`; keeps bits [7:0] |
+| SDD-IIC-3.7 | `pop_rx_fifo_byte()` | Flow-controlled RX | Waits on RX_EMPTY with `check_rx_wait_errors()` each poll, ≤ `P`; keeps bits [7:0] |
 | SDD-IIC-3.8 | `wait_tx_complete()` | End-of-transfer wait | Loops on `is_tx_idle()`; last ISR check catches a NACK that latched as the bus went idle |
 | SDD-IIC-3.9 | `is_timeout_valid()` | `1 ≤ P ≤ 10⁷` | Nested `if`: no coupled condition |
 | SDD-IIC-3.10 | `is_xfer_len_valid()` | `1 ≤ n ≤ 32` | Nested `if`: no coupled condition |
 | SDD-IIC-3.11 | `validate_xfer_args()` | Shared public-entry checks | PARAM checks first, then STATE |
 | SDD-IIC-3.12 | `is_tx_idle()` | SR → done? | `if / else if` on TX_EMPTY then BB (keeps the decision uncoupled) |
+| SDD-IIC-3.13 | `check_rx_wait_errors()` | ISR check while waiting for RX data | ARB_LOST → error. TX_ERR → re-read SR: RX has data → master's final NACK → OK; RX empty but BB = 1 → transfer still running → keep waiting; RX empty and BB = 0 → slave NACK → error |
+| SDD-IIC-3.14 | `check_arb_lost()` | ISR check after all bytes are received | Only ARB_LOST is an error (with recovery) |
+| SDD-IIC-3.15 | `clear_master_nack_flag()` | Clear the expected flag | Toggle-on-write of ISR.TX_ERR if latched |
+| SDD-IIC-3.16 | `wait_rx_complete()` | End-of-receive wait | Same loop as `wait_tx_complete()` using `check_arb_lost()`; on success calls `clear_master_nack_flag()` |
+| SDD-IIC-3.17 | `rx_timeout_status()` | Classify an RX wait without data | TX_ERR latched → recovery + `ERR_NACK_ARB`; else `ERR_TIMEOUT` |
+
+**Why 3.13 … 3.16 exist (OI-03, confirmed on hardware):** at the end of a
+read the master NACKs the last byte to tell the slave to stop. The AXI IIC
+core latches ISR.TX_ERR for that NACK too. The board diagnostic gave, at
+address 0x48: HAL `ERR_NACK_ARB`, ID byte `0xCB` received correctly,
+SR `0xCC`, ISR `0xD0`. Treating that flag as a slave error made every read
+fail after its data had arrived. A real slave NACK still fails, because it
+leaves the RX FIFO empty (board result at 0x49 … 0x4B: `ERR_NACK_ARB`, no
+data, SR `0xC4`).
+
+**Flag / data order (raw probe on the board, no HAL):** `id = 0xCB`, ISR
+before `0xD0`, ISR *when the data byte was first seen* `0xD2`, ISR at end
+`0xD2` (TX_ERR = 1, ARB_LOST = 0), SR at end `0xC8`. TX_ERR is therefore
+already visible when the last byte becomes visible; the two events are
+less than one register read apart, in an order that cannot be resolved.
+SDD-IIC-3.13 thus never decides from "TX_ERR set and RX still empty"
+alone: while SR.BB = 1 it keeps waiting, and only a released bus without
+data is a slave NACK. A behavioural model of the core reproduces the board
+readout exactly and shows that a check based only on the RX FIFO fails if
+the flag leads the data by one SCL bit, while 3.13 passes in every order.
 
 ---
 
@@ -625,7 +653,7 @@ the int16 range in `q8_7_to_reg16()`.
 | LLR-IIC-001 | SDD-IIC-1.1, 1.2, 3.1, 3.2 | `axi_iic_status_t`, `axi_iic_init_state_t`, `reg_read32`, `reg_write32` |
 | LLR-IIC-002 | SDD-IIC-1.3, 2.1, 3.3, 3.9 | `axi_iic_dev_t`, `axi_iic_init`, `clear_tx_fifo_and_errors`, `is_timeout_valid` |
 | LLR-IIC-003 | SDD-IIC-2.2, 3.4, 3.5, 3.6, 3.8, 3.10, 3.11, 3.12 | `axi_iic_write_bytes`, `wait_bus_not_busy`, `check_isr_errors`, `push_tx_fifo_word`, `wait_tx_complete`, `is_xfer_len_valid`, `validate_xfer_args`, `is_tx_idle` |
-| LLR-IIC-004 | SDD-IIC-2.3, 3.7, 3.10, 3.11 | `axi_iic_write_read_bytes`, `pop_rx_fifo_byte`, `is_xfer_len_valid`, `validate_xfer_args` |
+| LLR-IIC-004 | SDD-IIC-2.3, 3.7, 3.10, 3.11, 3.13 … 3.17 | `axi_iic_write_read_bytes`, `pop_rx_fifo_byte`, `is_xfer_len_valid`, `validate_xfer_args`, `check_rx_wait_errors`, `check_arb_lost`, `clear_master_nack_flag`, `wait_rx_complete`, `rx_timeout_status` |
 | LLR-ADT-001 | SDD-ADT-1.1, 1.2, 1.12, 2.1, 2.2, 2.3, 3.3, 3.6, 3.8, 3.9 | `adt7410_status_t`, `adt7410_init_state_t`, `adt7410_dev_t`, `adt7410_init`, `adt7410_soft_reset`, `adt7410_read_id`, `map_iic_status`, `read_reg8`, `read_id_fields`, `is_slave_addr_valid` |
 | LLR-ADT-002 | SDD-ADT-1.3 … 1.7, 1.9, 2.4, 2.5, 2.7, 3.1, 3.2, 3.4, 3.6, 3.11, 3.12, 3.13 | config enums, `adt7410_config_t`, `adt7410_set_config`, `adt7410_get_config`, `adt7410_trigger_one_shot`, `op_mode_lut`, `fault_queue_lut`, `write_reg8`, `read_reg8`, `is_config_valid`, `config_to_reg`, `reg_to_config` |
 | LLR-ADT-003 | SDD-ADT-1.10, 1.11, 2.6, 2.8, 2.13, 3.6, 3.7, 3.14, 3.16, 3.18, 3.20, 3.21 | `adt7410_status_flags_t`, `adt7410_sample_t`, `adt7410_read_status`, `adt7410_read_temperature`, `adt7410_read_temp_degc`, `read_reg8`, `read_reg16`, `reg_to_status_flags`, `reg16_to_q8_7`, `q8_7_to_mdegc`, `q8_7_to_degc`, `reg16_to_sample` |
@@ -646,7 +674,7 @@ orphan code.
 ## 9. Open items
 
 All open items are tracked in `OPEN_ITEMS.md`. Items that affect this
-design: `OI-02` (`ADT7410_ERR_NOT_READY`), `OI-03` (ISR.TX_ERR at the end
-of a master receive), `OI-04` (target stack / WCET figures), `OI-05`
+design: `OI-02` (`ADT7410_ERR_NOT_READY`), `OI-03` (closed in code: TX_ERR at
+the end of a master receive, SDD-IIC-3.13 … 3.17), `OI-04` (target stack / WCET figures), `OI-05`
 (`ASSERT` trap), `OI-06` (datasheet references), `OI-08` (poll budget and
 10 ms timing, SDD-APP-4).

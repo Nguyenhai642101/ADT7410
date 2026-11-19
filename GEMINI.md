@@ -61,7 +61,7 @@ Never violate these core constraints in `include/` and `src/`:
 See `docs/OPEN_ITEMS.md` before changing related behavior:
 - `OI-01`: HLR is a draft placeholder (`docs/HLR_ADT7410_AXI_IIC.md`); LLR groups are linked to proposed HLR IDs, approval pending.
 - `OI-02`: `ADT7410_ERR_NOT_READY` is defined in `adt7410_status_t` but currently unused.
-- `OI-03`: Confirm `ISR.TX_ERR` behavior at end of master receive on hardware.
+- `OI-03`: Closed in code — `ISR.TX_ERR` is latched by the master's final NACK (confirmed on hardware); re-test the fix on the board.
 - `OI-04`: Regenerate `.su` stack usage and WCET figures with the target ARM cross-compiler.
 - `OI-05`: `ASSERT(expr)` under `DEBUG_BUILD` currently has an empty `/* trap */` body pending project fault handler hookup.
 - `OI-06`: Verify cited `[ADT7410]` and `[PG090]` table/page numbers against configuration-controlled datasheet revisions.

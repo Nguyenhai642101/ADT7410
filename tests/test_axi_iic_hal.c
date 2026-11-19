@@ -178,11 +178,16 @@ static void tc_iic_013(void)
     axi_iic_status_t status;
 
     th_begin("TC-IIC-013", "LLR-IIC-003.5,003.8",
-             "write_bytes ERR_TIMEOUT when TX_FULL stays set");
+             "TX_FULL (SR bit 4) timeout; RX_FULL (bit 5) does not block");
     setup_ready(RM_SR_TX_FULL, 0U);
     status = axi_iic_write_bytes(&iic, 0x48U, payload, 2U);
     TH_CHECK(AXI_IIC_ERR_TIMEOUT == status);
     TH_CHECK(0xDEADU == rm_regs[RM_TX_FIFO]);
+
+    /* SR bit 5 is RX_FULL (PG090), not TX_FULL: it must not block TX */
+    setup_ready(RM_SR_TX_EMPTY | 0x20U, 0U);
+    status = axi_iic_write_bytes(&iic, 0x48U, payload, 2U);
+    TH_CHECK(AXI_IIC_OK == status);
     th_end();
 }
 
@@ -339,6 +344,38 @@ static void tc_iic_022(void)
 }
 
 
+static void tc_iic_023(void)
+{
+    uint8_t rx_bytes[2] = { 0x11U, 0x22U };
+    axi_iic_status_t status;
+
+    th_begin("TC-IIC-023", "LLR-IIC-004.4,004.6",
+             "read: master's final NACK (TX_ERR + data) is not an error");
+    /* OI-03: TX_ERR latched while the received bytes are in the RX FIFO */
+    setup_ready(RM_SR_TX_EMPTY, RM_ISR_TX_ERR);
+    rm_regs[RM_RX_FIFO] = 0xCBU;
+    status = axi_iic_write_read_bytes(&iic, 0x48U, 0x0BU, rx_bytes, 2U);
+    TH_CHECK(AXI_IIC_OK == status);
+    TH_CHECK((0xCBU == rx_bytes[0]) && (0xCBU == rx_bytes[1]));
+
+    /* Same situation but arbitration lost: still an error */
+    setup_ready(RM_SR_TX_EMPTY, RM_ISR_TX_ERR | RM_ISR_ARB_LOST);
+    status = axi_iic_write_read_bytes(&iic, 0x48U, 0x0BU, rx_bytes, 2U);
+    TH_CHECK(AXI_IIC_ERR_NACK_ARB == status);
+
+    /* Arbitration lost while waiting for RX data: error */
+    setup_ready(RM_SR_TX_EMPTY | RM_SR_RX_EMPTY, RM_ISR_ARB_LOST);
+    status = axi_iic_write_read_bytes(&iic, 0x48U, 0x0BU, rx_bytes, 2U);
+    TH_CHECK(AXI_IIC_ERR_NACK_ARB == status);
+
+    /* Write path unchanged: TX_ERR at completion is a slave NACK */
+    setup_ready(RM_SR_TX_EMPTY, RM_ISR_TX_ERR);
+    status = axi_iic_write_bytes(&iic, 0x48U, rx_bytes, 2U);
+    TH_CHECK(AXI_IIC_ERR_NACK_ARB == status);
+    th_end();
+}
+
+
 int main(void)
 {
     tc_iic_001();
@@ -354,6 +391,7 @@ int main(void)
     tc_iic_020();
     tc_iic_021();
     tc_iic_022();
+    tc_iic_023();
 
     return th_summary("axi_iic_hal");
 }

@@ -39,7 +39,7 @@
 
 /* SR / ISR bits (PG090) */
 #define RM_SR_BB            (0x04U)
-#define RM_SR_TX_FULL       (0x20U)
+#define RM_SR_TX_FULL       (0x10U)   /* PG090 SR bit 4 */
 #define RM_SR_RX_EMPTY      (0x40U)
 #define RM_SR_TX_EMPTY      (0x80U)
 #define RM_ISR_ARB_LOST     (0x01U)

@@ -3,7 +3,7 @@
 | Field | Value |
 |:---|:---|
 | Document ID | LLR-ADT-IIC |
-| Revision | Draft B |
+| Revision | Draft C |
 | Software items | `include/axi_iic_hal.h`, `src/axi_iic_hal.c`, `include/adt7410_driver.h`, `src/adt7410_driver.c`, `src/main.c` |
 | Parent document | HLR-ADT-IIC (`HLR_ADT7410_AXI_IIC.md`, draft placeholder) |
 | Design document | SDD-ADT-IIC (`SDD_ADT7410_AXI_IIC.md`) |
@@ -17,6 +17,7 @@
 |:---|:---|
 | Draft A | Initial LLR for HAL and driver |
 | Draft B | Added LLR-ADT-003.8 (float degC API); linked every group to the draft HLR; added LLR-APP-001 … 005 for `src/main.c`; restored Markdown formatting |
+| Draft C | LLR-IIC-004.4 reworded and LLR-IIC-004.6 added: in a master receive, ISR.TX_ERR raised by the master's own final NACK is not an error (OI-03, confirmed on hardware). 004.4 decides from SR, independent of whether the core shows TX_ERR before or together with the last byte (raw probe 2026-11-19) |
 
 ---
 
@@ -132,16 +133,17 @@ only after the system HLR document is approved (`OI-01`).
 | Field | Value |
 |:---|:---|
 | Parent HLR | `HLR-IIC-001` (draft) |
-| Derived | No |
-| Design | SDD-IIC-2.3, SDD-IIC-3.7, SDD-IIC-3.10, SDD-IIC-3.11 |
+| Derived | Partly (004.6 is derived: AXI IIC core behaviour, OI-03) |
+| Design | SDD-IIC-2.3, SDD-IIC-3.7, SDD-IIC-3.10, SDD-IIC-3.11, SDD-IIC-3.13 … 3.17 |
 
 | Clause | Requirement | Method |
 |:---|:---|:---|
 | 004.1 | `axi_iic_write_read_bytes()` shall apply the argument and state checks of 003.1 and 003.2, with `p_rx_bytes` and `rx_len_bytes` in place of the TX arguments. | T |
 | 004.2 | The HAL shall send the TX_FIFO words in this order: `START \| (addr << 1) \| 0`, `reg_addr`, `START \| (addr << 1) \| 1`, `STOP \| rx_len_bytes`. | T |
 | 004.3 | The HAL shall read `rx_len_bytes` bytes from RX_FIFO bits [7:0] into `p_rx_bytes[0..n-1]` in order. Before each read it shall wait while SR.RX_EMPTY = 1, and return `AXI_IIC_ERR_TIMEOUT` after `P` polls. | T |
-| 004.4 | Bus-idle wait, error detection and completion shall follow 003.3, 003.6 and 003.7. | T |
+| 004.4 | The bus-idle wait shall follow 003.3. While waiting for RX data, ISR.ARB_LOST shall be an error. A latched ISR.TX_ERR shall be an error only when the RX FIFO is empty **and** the bus is released (SR.BB = 0), i.e. the slave did not acknowledge; while data is present or the transfer is still running, waiting shall continue. If no data arrives within `P` polls, the HAL shall return `AXI_IIC_ERR_NACK_ARB` when TX_ERR is latched, else `AXI_IIC_ERR_TIMEOUT`. The error handling of 003.6 applies. | T |
 | 004.5 | The total poll iterations of one call shall not exceed `(rx_len_bytes + 6) × P`. | A |
+| 004.6 | After all `rx_len_bytes` bytes have been received, the HAL shall wait until SR.TX_EMPTY = 1 and SR.BB = 0 (`AXI_IIC_ERR_TIMEOUT` after `P` polls), shall report only ISR.ARB_LOST as an error, and shall clear a latched ISR.TX_ERR, which is the master's own NACK of the last byte. *(Derived: AXI IIC core latches TX_ERR on the master's final NACK — confirmed on hardware, OI-03.)* | T, HIL |
 
 ---
 
@@ -315,7 +317,7 @@ The current results are in `test_report.md` (§6 requirement matrix).
 
 | LLR group | Host test | Target / HIL test | Notes |
 |:---|:---|:---|:---|
-| LLR-IIC-001 … 004 | Done (RAM register model, 13 TC) | **Required** | Full frame sequence and GAP-01 need target / HIL |
+| LLR-IIC-001 … 004 | Done (RAM register model, 14 TC) | **Required** | Full frame sequence and GAP-01 need target / HIL |
 | LLR-ADT-001 … 005 | Done (mock HAL, 31 TC; integration 2 TC) | Required | Real silicon check (temperature chamber) |
 | LLR-APP-001 … 005 | Done (mock HAL, 10 TC) | Required | Real INT edge, 10 ms timing (`OI-08`) |
 
@@ -329,5 +331,5 @@ The current results are in `test_report.md` (§6 requirement matrix).
 
 All open items are tracked in `OPEN_ITEMS.md`. Items that affect this
 document: `OI-01` (HLR approval), `OI-02` (`ADT7410_ERR_NOT_READY` unused),
-`OI-03` (ISR.TX_ERR at the end of a master receive), `OI-07` (derived
+`OI-03` (closed in code: TX_ERR at the end of a master receive, re-test on board), `OI-07` (derived
 requirements to safety assessment), `OI-08` (poll budget and 10 ms timing).
